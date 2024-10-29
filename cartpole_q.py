@@ -18,16 +18,18 @@ def run(is_training=True, render=False, plot_interval=50):
     env = gym.make('CartPole-v1', render_mode='human' if render else None)
     
     # Set up state space discretization
-    # These values represent the range of each state variable in the CartPole environment
     STATE_SPACES = {
-        'cart_position': {'min': -2.4, 'max': 2.4},      # Position of cart on track
-        'cart_velocity': {'min': -4.0, 'max': 4.0},      # Velocity of cart
-        'pole_angle': {'min': -0.2095, 'max': 0.2095},   # Angle of pole (in radians)
-        'pole_velocity': {'min': -4.0, 'max': 4.0}       # Angular velocity of pole
+        'cart_position': {'min': -2.4, 'max': 2.4},         # Position of cart on track
+        'cart_velocity': {'min': -4.0, 'max': 4.0},         # Velocity of cart
+        'pole_angle':    {'min': -0.2095, 'max': 0.2095},   # Angle of pole (in radians)
+        'pole_velocity': {'min': -4.0, 'max': 4.0}          # Angular velocity of pole
     }
     
     # Number of bins for discretizing each state variable
     BINS = 10
+
+    # Maximum number of episodes to run during training
+    MAX_EPISODES = 10000
     
     # Create discretized spaces for each state variable
     discretized_spaces = {
@@ -44,24 +46,32 @@ def run(is_training=True, render=False, plot_interval=50):
             high=0.1, 
             size=state_dimensions + (env.action_space.n,)
         )
+        # Initialize best model tracking
+        best_Q_table = Q_table.copy()
+        best_mean_reward = 0
+        best_episode = 0
+        n_evaluations_without_improvement = 0
     else:
         try:
-            with open('cartpole_q.pkl', 'rb') as f:
-                Q_table = pickle.load(f)
-            print("Loaded previously trained Q-table")
+            with open('cartpole_q_best.pkl', 'rb') as f:
+                model_data = pickle.load(f)
+                Q_table = model_data['q_table']
+                best_episode = model_data['episode']
+                best_mean_reward = model_data['mean_reward']
+            print(f"Loaded best Q-table (from episode {best_episode}, mean reward: {best_mean_reward:.1f})")
         except FileNotFoundError:
             print("Error: No trained model found. Please run training first.")
             return
     
     # Training hyperparameters
     LEARNING_PARAMS = {
-        'alpha': 0.2,           # Learning rate: how much to update Q-values (0-1)
-        'gamma': 0.99,          # Discount factor: importance of future rewards (0-1)
-        'epsilon': 1.0,         # Initial exploration rate
-        'epsilon_decay': 0.999, # How much to decrease epsilon each episode
-        'epsilon_min': 0.01,    # Minimum exploration rate
-        'max_steps': 10000,     # Maximum steps per episode
-        'target_reward': 1000   # Target reward for considering training successful
+        'alpha': 0.2,            # Learning rate: how much to update Q-values (0-1)
+        'gamma': 0.99,           # Discount factor: importance of future rewards (0-1)
+        'epsilon': 1.0,          # Initial exploration rate
+        'epsilon_decay': 0.9995, # How much to decrease epsilon each episode
+        'epsilon_min': 0.01,     # Minimum exploration rate
+        'max_steps': 1000,       # Maximum steps per episode
+        'target_reward': 1000    # Target reward for considering training successful
     }
 
     # Initialize training metrics
@@ -78,6 +88,7 @@ def run(is_training=True, render=False, plot_interval=50):
         # Initialize plot lines
         rewards_line, = ax1.plot([], [], 'b-', label='Rewards')
         mean_rewards_line, = ax1.plot([], [], 'r-', label='Mean Rewards (100 ep)')
+        best_reward_line, = ax1.plot([], [], 'g*', label='Best Model')
         epsilon_line, = ax2.plot([], [], 'g-', label='Epsilon')
         
         # Set up plot layouts
@@ -116,6 +127,9 @@ def run(is_training=True, render=False, plot_interval=50):
                 moving_avg = [np.mean(rewards_history[max(0, i-100):i+1]) 
                             for i in range(len(rewards_history))]
                 mean_rewards_line.set_data(episodes_x, moving_avg)
+                
+                # Update best model marker
+                best_reward_line.set_data([best_episode], [best_mean_reward])
             
             # Update epsilon plot
             ax2.set_xlim(0, len(epsilon_history))
@@ -170,13 +184,34 @@ def run(is_training=True, render=False, plot_interval=50):
             if episodes % plot_interval == 0:
                 update_plots()
             
+            # Calculate mean reward
+            mean_reward = np.mean(rewards_history[-100:]) if len(rewards_history) >= 100 else np.mean(rewards_history)
+            
+            # Update best model if we have a new best performance
+            if mean_reward > best_mean_reward and len(rewards_history) >= 100:
+                best_mean_reward = mean_reward
+                best_Q_table = Q_table.copy()
+                best_episode = episodes
+                n_evaluations_without_improvement = 0
+                
+                # Save best model immediately
+                model_data = {
+                    'q_table': best_Q_table,
+                    'episode': best_episode,
+                    'mean_reward': best_mean_reward
+                }
+                with open('cartpole_q_best.pkl', 'wb') as f:
+                    pickle.dump(model_data, f)
+            else:
+                n_evaluations_without_improvement += 1
+            
             # Print training progress
             if episodes % 100 == 0:
-                mean_reward = np.mean(rewards_history[-100:]) if len(rewards_history) >= 100 else np.mean(rewards_history)
                 print(f'Episode: {episodes} | '
                       f'Reward: {episode_reward:.1f} | '
                       f'Epsilon: {LEARNING_PARAMS["epsilon"]:.2f} | '
-                      f'Mean Reward: {mean_reward:.1f}')
+                      f'Mean Reward: {mean_reward:.1f} | '
+                      f'Best Mean: {best_mean_reward:.1f} (ep {best_episode})')
 
             # Decay exploration rate
             LEARNING_PARAMS['epsilon'] = max(
@@ -187,7 +222,9 @@ def run(is_training=True, render=False, plot_interval=50):
         # Check if training is complete
         if len(rewards_history) >= 100:
             mean_reward = np.mean(rewards_history[-100:])
-            if mean_reward > LEARNING_PARAMS['target_reward'] or episodes >= 10000:
+            if (mean_reward > LEARNING_PARAMS['target_reward'] or 
+                episodes >= MAX_EPISODES or 
+                n_evaluations_without_improvement >= 1000):
                 break
 
         episodes += 1
@@ -195,12 +232,15 @@ def run(is_training=True, render=False, plot_interval=50):
     env.close()
 
     # Save results if training
-    if is_training:
-        print("\nSaving training results...")
-        
-        # Save Q-table
-        with open('cartpole_q.pkl', 'wb') as f:
-            pickle.dump(Q_table, f)
+    if is_training:                
+        # Save best Q-table again (in case of crash)
+        best_model_data = {
+            'q_table': best_Q_table,
+            'episode': best_episode,
+            'mean_reward': best_mean_reward
+        }
+        with open('cartpole_q_best.pkl', 'wb') as f:
+            pickle.dump(best_model_data, f)
         
         # Save final plot
         plt.savefig('cartpole_training_results.png')
@@ -208,7 +248,9 @@ def run(is_training=True, render=False, plot_interval=50):
         
         print(f"Training completed after {episodes} episodes")
         print(f"Final average reward: {mean_reward:.1f}")
-        print("Q-table and training plots have been saved")
+        print(f"Best average reward: {best_mean_reward:.1f} (achieved at episode {best_episode})")
+        print(f"Episodes since best model: {episodes - best_episode}")
+        print("Q-tables and training plots have been saved")
 
 if __name__ == '__main__':
     # run(is_training=True, render=False, plot_interval=50)
